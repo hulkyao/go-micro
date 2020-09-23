@@ -60,8 +60,8 @@ func (k *kubernetes) namespaceExists(name string) (bool, error) {
 	return false, nil
 }
 
-// createNamespace creates a new k8s namespace
-func (k *kubernetes) createNamespace(namespace string) error {
+// autoCreateNamespace creates a new k8s namespace
+func (k *kubernetes) autoCreateNamespace(namespace string) error {
 	ns := client.Namespace{Metadata: &client.Metadata{Name: namespace}}
 	err := k.client.Create(&client.Resource{Kind: "namespace", Value: ns})
 
@@ -250,32 +250,52 @@ func (k *kubernetes) Init(opts ...runtime.Option) error {
 	return nil
 }
 
-func (k *kubernetes) Logs(s *runtime.Service, options ...runtime.LogsOption) (runtime.Logs, error) {
-	klo := newLog(k.client, s.Name, options...)
+func (k *kubernetes) Logs(resource runtime.Resource, options ...runtime.LogsOption) (runtime.Logs, error) {
 
-	if !klo.options.Stream {
-		records, err := klo.Read()
+	// Handle the various different types of resources:
+	switch resource.Type() {
+	case runtime.TypeNamespace:
+		// noop (Namespace is not supported by *kubernetes.Logs())
+		return nil, nil
+	case runtime.TypeNetworkPolicy:
+		// noop (NetworkPolicy is not supported by *kubernetes.Logs()))
+		return nil, nil
+	case runtime.TypeService:
+
+		// Assert the resource back into a *runtime.Service
+		s, ok := resource.(*runtime.Service)
+		if !ok {
+			return nil, runtime.ErrInvalidResource
+		}
+
+		klo := newLog(k.client, s.Name, options...)
+
+		if !klo.options.Stream {
+			records, err := klo.Read()
+			if err != nil {
+				log.Errorf("Failed to get logs for service '%v' from k8s: %v", s.Name, err)
+				return nil, err
+			}
+			kstream := &kubeStream{
+				stream: make(chan runtime.Log),
+				stop:   make(chan bool),
+			}
+			go func() {
+				for _, record := range records {
+					kstream.Chan() <- record
+				}
+				kstream.Stop()
+			}()
+			return kstream, nil
+		}
+		stream, err := klo.Stream()
 		if err != nil {
-			log.Errorf("Failed to get logs for service '%v' from k8s: %v", s.Name, err)
 			return nil, err
 		}
-		kstream := &kubeStream{
-			stream: make(chan runtime.Log),
-			stop:   make(chan bool),
-		}
-		go func() {
-			for _, record := range records {
-				kstream.Chan() <- record
-			}
-			kstream.Stop()
-		}()
-		return kstream, nil
+		return stream, nil
+	default:
+		return nil, runtime.ErrInvalidResource
 	}
-	stream, err := klo.Stream()
-	if err != nil {
-		return nil, err
-	}
-	return stream, nil
 }
 
 type kubeStream struct {
@@ -308,8 +328,8 @@ func (k *kubeStream) Stop() error {
 	return nil
 }
 
-// Creates a service
-func (k *kubernetes) Create(s *runtime.Service, opts ...runtime.CreateOption) error {
+// Create a resource
+func (k *kubernetes) Create(resource runtime.Resource, opts ...runtime.CreateOption) error {
 	k.Lock()
 	defer k.Unlock()
 
@@ -321,56 +341,83 @@ func (k *kubernetes) Create(s *runtime.Service, opts ...runtime.CreateOption) er
 		o(&options)
 	}
 
-	// default type if it doesn't exist
-	if len(options.Type) == 0 {
-		options.Type = k.options.Type
-	}
+	// Handle the various different types of resources:
+	switch resource.Type() {
+	case runtime.TypeNamespace:
+		// Assert the resource back into a *runtime.Namespace
+		namespace, ok := resource.(*runtime.Namespace)
+		if !ok {
+			return runtime.ErrInvalidResource
+		}
+		return k.createNamespace(namespace)
+	case runtime.TypeNetworkPolicy:
+		// Assert the resource back into a *runtime.NetworkPolicy
+		networkPolicy, ok := resource.(*runtime.NetworkPolicy)
+		if !ok {
+			return runtime.ErrInvalidResource
+		}
+		return k.createNetworkPolicy(networkPolicy)
+	case runtime.TypeService:
 
-	// default the source if it doesn't exist
-	if len(s.Source) == 0 {
-		s.Source = k.options.Source
-	}
+		// Assert the resource back into a *runtime.Service
+		s, ok := resource.(*runtime.Service)
+		if !ok {
+			return runtime.ErrInvalidResource
+		}
 
-	// ensure the namespace exists
-	namespace := client.SerializeResourceName(options.Namespace)
-	// only do this if the namespace is not default
-	if namespace != "default" {
-		if exist, err := k.namespaceExists(namespace); err == nil && !exist {
-			if err := k.createNamespace(namespace); err != nil {
+		// default type if it doesn't exist
+		if len(options.Type) == 0 {
+			options.Type = k.options.Type
+		}
+
+		// default the source if it doesn't exist
+		if len(s.Source) == 0 {
+			s.Source = k.options.Source
+		}
+
+		// ensure the namespace exists
+		namespace := client.SerializeResourceName(options.Namespace)
+		// only do this if the namespace is not default
+		if namespace != "default" {
+			if exist, err := k.namespaceExists(namespace); err == nil && !exist {
+				if err := k.autoCreateNamespace(namespace); err != nil {
+					if logger.V(logger.WarnLevel, logger.DefaultLogger) {
+						logger.Warnf("Error creating namespace %v: %v", namespace, err)
+					}
+					return err
+				}
+			} else if err != nil {
 				if logger.V(logger.WarnLevel, logger.DefaultLogger) {
-					logger.Warnf("Error creating namespace %v: %v", namespace, err)
+					logger.Warnf("Error checking namespace %v exists: %v", namespace, err)
 				}
 				return err
 			}
-		} else if err != nil {
-			if logger.V(logger.WarnLevel, logger.DefaultLogger) {
-				logger.Warnf("Error checking namespace %v exists: %v", namespace, err)
+		}
+		// determine the image from the source and options
+		options.Image = k.getImage(s, options)
+
+		// create a secret for the credentials if some where provided
+		if len(options.Secrets) > 0 {
+			if err := k.createCredentials(s, options); err != nil {
+				if logger.V(logger.WarnLevel, logger.DefaultLogger) {
+					logger.Warnf("Error generating auth credentials for service: %v", err)
+				}
+				return err
 			}
-			return err
-		}
-	}
-	// determine the image from the source and options
-	options.Image = k.getImage(s, options)
 
-	// create a secret for the credentials if some where provided
-	if len(options.Secrets) > 0 {
-		if err := k.createCredentials(s, options); err != nil {
-			if logger.V(logger.WarnLevel, logger.DefaultLogger) {
-				logger.Warnf("Error generating auth credentials for service: %v", err)
+			if logger.V(logger.DebugLevel, logger.DefaultLogger) {
+				logger.Debugf("Generated auth credentials for service %v", s.Name)
 			}
-			return err
 		}
 
-		if logger.V(logger.DebugLevel, logger.DefaultLogger) {
-			logger.Debugf("Generated auth credentials for service %v", s.Name)
-		}
+		// create new service
+		service := newService(s, options)
+
+		// start the service
+		return service.Start(k.client, client.CreateNamespace(options.Namespace))
+	default:
+		return runtime.ErrInvalidResource
 	}
-
-	// create new service
-	service := newService(s, options)
-
-	// start the service
-	return service.Start(k.client, client.CreateNamespace(options.Namespace))
 }
 
 // Read returns all instances of given service
@@ -415,60 +462,85 @@ func (k *kubernetes) Read(opts ...runtime.ReadOption) ([]*runtime.Service, error
 	return services, nil
 }
 
-// Update the service in place
-func (k *kubernetes) Update(s *runtime.Service, opts ...runtime.UpdateOption) error {
+// Update a resource in place
+func (k *kubernetes) Update(resource runtime.Resource, opts ...runtime.UpdateOption) error {
 	options := runtime.UpdateOptions{
 		Namespace: client.DefaultNamespace,
 	}
-
 	for _, o := range opts {
 		o(&options)
 	}
 
-	labels := map[string]string{}
+	// Handle the various different types of resources:
+	switch resource.Type() {
+	case runtime.TypeNamespace:
+		// noop (Namespace is not supported by *kubernetes.Update())
+		return nil
+	case runtime.TypeNetworkPolicy:
+		// Assert the resource back into a *runtime.NetworkPolicy
+		networkPolicy, ok := resource.(*runtime.NetworkPolicy)
+		if !ok {
+			return runtime.ErrInvalidResource
+		}
+		return k.updateNetworkPolicy(networkPolicy)
+	case runtime.TypeService:
 
-	if len(s.Name) > 0 {
-		labels["name"] = client.Format(s.Name)
-	}
-
-	if len(s.Version) > 0 {
-		labels["version"] = client.Format(s.Version)
-	}
-
-	// get the existing service
-	services, err := k.getService(labels, client.GetNamespace(options.Namespace))
-	if err != nil {
-		return err
-	}
-
-	// update the relevant services
-	for _, service := range services {
-		// nil check
-		if service.kdeploy.Metadata == nil || service.kdeploy.Metadata.Annotations == nil {
-			md := new(client.Metadata)
-			md.Annotations = make(map[string]string)
-			service.kdeploy.Metadata = md
+		// Assert the resource back into a *runtime.Service
+		s, ok := resource.(*runtime.Service)
+		if !ok {
+			return runtime.ErrInvalidResource
 		}
 
-		// update metadata
-		for k, v := range s.Metadata {
-			service.kdeploy.Metadata.Annotations[k] = v
+		labels := map[string]string{}
+
+		if len(s.Name) > 0 {
+			labels["name"] = client.Format(s.Name)
 		}
 
-		// update build time annotation
-		service.kdeploy.Spec.Template.Metadata.Annotations["updated"] = fmt.Sprintf("%d", time.Now().Unix())
+		if len(s.Version) > 0 {
+			labels["version"] = client.Format(s.Version)
+		}
 
-		// update the service
-		if err := service.Update(k.client, client.UpdateNamespace(options.Namespace)); err != nil {
+		// get the existing service
+		services, err := k.getService(labels, client.GetNamespace(options.Namespace))
+		if err != nil {
 			return err
 		}
-	}
 
-	return nil
+		// update the relevant services
+		for _, service := range services {
+			// nil check
+			if service.kdeploy.Metadata == nil || service.kdeploy.Metadata.Annotations == nil {
+				md := new(client.Metadata)
+				md.Annotations = make(map[string]string)
+				service.kdeploy.Metadata = md
+			}
+
+			// update metadata
+			for k, v := range s.Metadata {
+				service.kdeploy.Metadata.Annotations[k] = v
+			}
+
+			// update build time annotation
+			service.kdeploy.Spec.Template.Metadata.Annotations["updated"] = fmt.Sprintf("%d", time.Now().Unix())
+
+			// update the service
+			if err := service.Update(k.client, client.UpdateNamespace(options.Namespace)); err != nil {
+				return err
+			}
+		}
+
+		return nil
+	default:
+		return runtime.ErrInvalidResource
+	}
 }
 
-// Delete removes a service
-func (k *kubernetes) Delete(s *runtime.Service, opts ...runtime.DeleteOption) error {
+// Delete removes a resource
+func (k *kubernetes) Delete(resource runtime.Resource, opts ...runtime.DeleteOption) error {
+	k.Lock()
+	defer k.Unlock()
+
 	options := runtime.DeleteOptions{
 		Namespace: client.DefaultNamespace,
 	}
@@ -476,26 +548,50 @@ func (k *kubernetes) Delete(s *runtime.Service, opts ...runtime.DeleteOption) er
 		o(&options)
 	}
 
-	k.Lock()
-	defer k.Unlock()
+	// Handle the various different types of resources:
+	switch resource.Type() {
+	case runtime.TypeNamespace:
+		// Assert the resource back into a *runtime.Namespace
+		namespace, ok := resource.(*runtime.Namespace)
+		if !ok {
+			return runtime.ErrInvalidResource
+		}
+		return k.deleteNamespace(namespace)
+	case runtime.TypeNetworkPolicy:
+		// Assert the resource back into a *runtime.NetworkPolicy
+		networkPolicy, ok := resource.(*runtime.NetworkPolicy)
+		if !ok {
+			return runtime.ErrInvalidResource
+		}
+		return k.deleteNetworkPolicy(networkPolicy)
+	case runtime.TypeService:
 
-	// create new kubernetes micro service
-	service := newService(s, runtime.CreateOptions{
-		Type:      k.options.Type,
-		Namespace: options.Namespace,
-	})
+		// Assert the resource back into a *runtime.Service
+		s, ok := resource.(*runtime.Service)
+		if !ok {
+			return runtime.ErrInvalidResource
+		}
 
-	// delete the service credentials
-	ns := client.DeleteNamespace(options.Namespace)
-	k.client.Delete(&client.Resource{Name: credentialsName(s), Kind: "secret"}, ns)
+		// create new kubernetes micro service
+		service := newService(s, runtime.CreateOptions{
+			Type:      k.options.Type,
+			Namespace: options.Namespace,
+		})
 
-	if err := service.Stop(k.client, ns); err == api.ErrNotFound {
-		return runtime.ErrNotFound
-	} else if err != nil {
-		return err
+		// delete the service credentials
+		ns := client.DeleteNamespace(options.Namespace)
+		k.client.Delete(&client.Resource{Name: credentialsName(s), Kind: "secret"}, ns)
+
+		if err := service.Stop(k.client, ns); err == api.ErrNotFound {
+			return runtime.ErrNotFound
+		} else if err != nil {
+			return err
+		}
+
+		return nil
+	default:
+		return runtime.ErrInvalidResource
 	}
-
-	return nil
 }
 
 // Start starts the runtime
@@ -592,38 +688,6 @@ func (k *kubernetes) createCredentials(service *runtime.Service, options runtime
 func credentialsName(service *runtime.Service) string {
 	name := fmt.Sprintf("%v-%v-credentials", service.Name, service.Version)
 	return client.SerializeResourceName(name)
-}
-
-func (k *kubernetes) CreateNamespace(ns string) error {
-	err := k.client.Create(&client.Resource{
-		Kind: "namespace",
-		Value: client.Namespace{
-			Metadata: &client.Metadata{
-				Name: ns,
-			},
-		},
-	})
-	if err != nil {
-		if logger.V(logger.ErrorLevel, logger.DefaultLogger) {
-			logger.Errorf("Error creating namespace %v: %v", ns, err)
-		}
-	}
-	return err
-}
-
-func (k *kubernetes) DeleteNamespace(ns string) error {
-	err := k.client.Delete(&client.Resource{
-		Kind: "namespace",
-		Name: ns,
-	})
-	if err != nil {
-		if err != nil {
-			if logger.V(logger.ErrorLevel, logger.DefaultLogger) {
-				logger.Errorf("Error deleting namespace %v: %v", ns, err)
-			}
-		}
-	}
-	return err
 }
 
 // transformStatus takes a deployment status (deploymentcondition.type) and transforms it into a
