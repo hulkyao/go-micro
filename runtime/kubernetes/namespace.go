@@ -10,12 +10,13 @@ import (
 func (k *kubernetes) createNamespace(namespace *runtime.Namespace) error {
 	err := k.client.Create(&client.Resource{
 		Kind: "namespace",
+		Name: namespace.Name,
 		Value: client.Namespace{
 			Metadata: &client.Metadata{
 				Name: namespace.Name,
 			},
 		},
-	})
+	}, client.CreateNamespace(namespace.Name))
 	if err != nil {
 		if logger.V(logger.ErrorLevel, logger.DefaultLogger) {
 			logger.Errorf("Error creating namespace %s: %v", namespace.String(), err)
@@ -29,7 +30,12 @@ func (k *kubernetes) deleteNamespace(namespace *runtime.Namespace) error {
 	err := k.client.Delete(&client.Resource{
 		Kind: "namespace",
 		Name: namespace.Name,
-	})
+		Value: client.Namespace{
+			Metadata: &client.Metadata{
+				Name: namespace.Name,
+			},
+		},
+	}, client.DeleteNamespace(namespace.Name))
 	if err != nil {
 		if logger.V(logger.ErrorLevel, logger.DefaultLogger) {
 			logger.Errorf("Error deleting namespace %s: %v", namespace.String(), err)

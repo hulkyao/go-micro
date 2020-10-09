@@ -63,7 +63,7 @@ func (k *kubernetes) namespaceExists(name string) (bool, error) {
 // autoCreateNamespace creates a new k8s namespace
 func (k *kubernetes) autoCreateNamespace(namespace string) error {
 	ns := client.Namespace{Metadata: &client.Metadata{Name: namespace}}
-	err := k.client.Create(&client.Resource{Kind: "namespace", Value: ns})
+	err := k.client.Create(&client.Resource{Kind: "namespace", Value: ns}, client.CreateNamespace(namespace))
 
 	// ignore err already exists
 	if err != nil && strings.Contains(err.Error(), "already exists") {
@@ -78,7 +78,7 @@ func (k *kubernetes) autoCreateNamespace(namespace string) error {
 		if networkPolicy, err := runtime.NewNetworkPolicy("ingress", namespace, map[string]string{"owner": "micro"}); err != nil {
 			return err
 		} else {
-			return k.Create(networkPolicy)
+			return k.Create(networkPolicy, runtime.CreateNamespace(namespace))
 		}
 	}
 
